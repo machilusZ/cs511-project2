@@ -1,18 +1,101 @@
 use pyo3::prelude::*;
 extern crate wake;
-use polars::prelude::*;
 use polars::prelude::DataFrame;
-use std::env;
 use wake::graph::*;
 
 pub mod tpch;
 pub mod utils;
 
+
 use tpch::*;
 
-#[pyfunction]
-fn test_function() -> String {
-    "Hello World from Rust".to_string()
+use arrow::ffi;
+use std::time::Instant;
+use polars::prelude::*;
+use polars_arrow::export::arrow;
+use pyo3::exceptions::PyValueError;
+use pyo3::ffi::Py_uintptr_t;
+use pyo3::{PyAny, PyObject, PyResult};
+use pyo3::types::{PyDict, PyString, PyList, PyLong};
+
+/// Take an arrow array from python and convert it to a rust arrow array.
+/// This operation does not copy data.
+fn array_to_rust(arrow_array: &PyAny) -> PyResult<ArrayRef> {
+    // prepare a pointer to receive the Array struct
+    let array = Box::new(ffi::ArrowArray::empty());
+    let schema = Box::new(ffi::ArrowSchema::empty());
+
+    let array_ptr = &*array as *const ffi::ArrowArray;
+    let schema_ptr = &*schema as *const ffi::ArrowSchema;
+
+    // make the conversion through PyArrow's private API
+    // this changes the pointer's memory and is thus unsafe. In particular, `_export_to_c` can go out of bounds
+    arrow_array.call_method1(
+        "_export_to_c",
+        (array_ptr as Py_uintptr_t, schema_ptr as Py_uintptr_t),
+    )?;
+
+    unsafe {
+        let field = ffi::import_field_from_c(schema.as_ref()).unwrap();
+        let array = ffi::import_array_from_c(*array, field.data_type).unwrap();
+        Ok(array.into())
+    }
+}
+
+/// Arrow array to Python.
+pub(crate) fn to_py_array(py: Python, pyarrow: &PyModule, array: ArrayRef) -> PyResult<PyObject> {
+    let schema = Box::new(ffi::export_field_to_c(&ArrowField::new(
+        "",
+        array.data_type().clone(),
+        true,
+    )));
+    let array = Box::new(ffi::export_array_to_c(array));
+
+    let schema_ptr: *const ffi::ArrowSchema = &*schema;
+    let array_ptr: *const ffi::ArrowArray = &*array;
+
+    let array = pyarrow.getattr("Array")?.call_method1(
+        "_import_from_c",
+        (array_ptr as Py_uintptr_t, schema_ptr as Py_uintptr_t),
+    )?;
+
+    Ok(array.to_object(py))
+}
+
+pub fn py_series_to_rust_series(series: &PyAny) -> PyResult<Series> {
+    // rechunk series so that they have a single arrow array
+    let series = series.call_method0("rechunk")?;
+
+    let name = series.getattr("name")?.extract::<String>()?;
+
+    // retrieve pyarrow array
+    let array = series.call_method0("to_arrow")?;
+
+    // retrieve rust arrow array
+    let array = array_to_rust(array)?;
+
+    Series::try_from((name.as_str(), array)).map_err(|e| PyValueError::new_err(format!("{}", e)))
+}
+
+pub fn rust_series_to_py_series(series: &Series) -> PyResult<PyObject> {
+    // ensure we have a single chunk
+    let series = series.rechunk();
+    let array = series.to_arrow(0);
+
+    // acquire the gil
+    #[allow(deprecated)]
+    let gil = Python::acquire_gil();
+    let py = gil.python();
+    // import pyarrow
+    let pyarrow = py.import("pyarrow")?;
+
+    // pyarrow array
+    let pyarrow_array = to_py_array(py, pyarrow, array)?;
+
+    // import polars
+    let polars = py.import("polars")?;
+    let out = polars.call_method1("from_arrow", (pyarrow_array,))?;
+    Ok(out.to_object(py))
 }
 
 #[pyfunction]
@@ -27,35 +110,68 @@ fn main() {
         .format_timestamp_micros()
         .init();
 
-    let args = env::args().skip(1).collect::<Vec<String>>();
-    let mut my_vec: Vec<String> = Vec::new();
-    let mut my_vec1: Vec<String> = Vec::new();
-    let name1 = String::from("query");
-    let name2 = String::from("q1");
-    my_vec.push(name1);
-    my_vec1.push(name2);
-    run_query(my_vec1);
-}
+    let q1 = String::from("q1");
 
-fn run_query(args: Vec<String>) {
-    if args.len() == 0 {
-        panic!("Query not specified. Run like: cargo run --release --example tpch_polars -- q1")
-    }
-    let query_no = args[0].as_str();
-    let scale = if args.len() <= 1 {
-        1
-    } else {
-        *(&args[1].parse::<usize>().unwrap())
-    };
-    let data_directory = if args.len() <= 2 {
-        "../../resources/tpc-h/data/scale=1/partition=1"
-    } else {
-        args[2].as_str()
-    };
+    let data_directory = "../../resources/tpc-h/data/scale=1/partition=1";
     let mut output_reader = NodeReader::empty();
-    let mut query_service = get_query_service(query_no, scale, data_directory, &mut output_reader);
-    log::info!("Running Query: {}", query_no);
-    utils::run_query(&mut query_service, &mut output_reader);
+    let mut query_service = get_query_service(&q1, 1, data_directory, &mut output_reader);
+    log::info!("Running Query: {}", q1);
+
+    let mut query_result: Vec<DataFrame> = vec![];
+    let start_time = Instant::now();
+
+    query_service.run();
+    loop {
+        // let res = py.allow_threads(move |&output_reader| {
+            let message = output_reader.read();
+            if message.is_eof() {
+                // return Err(message);
+                break;
+            }
+            // Ok(message)
+        // });
+        // let message = match res {
+        //     Ok(message) => message,
+        //     Err(error) => break,
+        // };
+        let df = message.datablock().data();
+        #[allow(deprecated)]
+        let gil = Python::acquire_gil();
+        let py = gil.python();
+
+        py.run("print(\"HERE\")", None, None).unwrap();
+
+        let dict = PyDict::new(py);
+        let mut all_py_series = Vec::new();
+        for col in df.get_columns() {
+            let py_ser = rust_series_to_py_series(col).unwrap();
+            let py_name = PyString::new(py, col.name());
+            dict.set_item(py_name, &py_ser).unwrap();
+            all_py_series.push(py_ser);
+        }
+        let pandas = py.import("pandas").unwrap();
+        let py_df = pandas.call_method1("DataFrame", (dict,)).unwrap();
+
+        let locals = PyDict::new(py);
+        locals.set_item("df", py_df).unwrap();
+        py.run(r#"
+res = df.plot.bar(x='l_returnflag', y='l_linestatus')
+res.show()
+"#, None, Some(locals)).unwrap();
+
+        // let plt = py.import("matplotlib.pyplot").unwrap();
+        // py_df.call_method("bar");
+        // plt.call_method1("bar", (&all_py_series[0], &all_py_series[1],)).unwrap();
+        // query_result.push(df.clone());
+    }
+    query_service.join();
+    let end_time = Instant::now();
+    log::info!("Query Result");
+    log::info!("{:?}", query_result[query_result.len() - 1]);
+    log::info!("Query Took: {:.2?}", end_time - start_time);
+
+    // let dfs = query_result;
+
 }
 
 pub fn get_query_service(
@@ -79,7 +195,6 @@ pub fn get_query_service(
 /// import the module.
 #[pymodule]
 fn tpch_polars(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
-    m.add_function(wrap_pyfunction!(test_function, m)?)?;
     m.add_function(wrap_pyfunction!(main, m)?)?;
     Ok(())
 }
