@@ -1,21 +1,14 @@
-use pyo3::prelude::*;
+// #[global_allocator]
+// static GLOBAL: jemallocator::Jemalloc = jemallocator::Jemalloc;
+
 extern crate wake;
-use polars::prelude::*;
 use polars::prelude::DataFrame;
 use std::env;
 use wake::graph::*;
 
-pub mod tpch;
-pub mod utils;
+use tpch_polars::tpch::*;
+use tpch_polars::utils;
 
-use tpch::*;
-
-#[pyfunction]
-fn test_function() -> String {
-    "Hello World from Rust".to_string()
-}
-
-#[pyfunction]
 fn main() {
     // Arguments:
     // 0: Whether to run query or test. Required. query/test.
@@ -28,13 +21,14 @@ fn main() {
         .init();
 
     let args = env::args().skip(1).collect::<Vec<String>>();
-    let mut my_vec: Vec<String> = Vec::new();
-    let mut my_vec1: Vec<String> = Vec::new();
-    let name1 = String::from("query");
-    let name2 = String::from("q1");
-    my_vec.push(name1);
-    my_vec1.push(name2);
-    run_query(my_vec1);
+    match args[0].as_str() {
+        "query" => run_query(args.into_iter().skip(1).collect::<Vec<String>>()),
+        _ => panic!(
+            "Invalid Argument to the cargo run command.
+        Run: `cargo run --release --example tpch_polars -- query q1` to run query q1.
+        Run `cargo run --release --example tpch_polars -- test` to run test for query q1."
+        ),
+    }
 }
 
 fn run_query(args: Vec<String>) {
@@ -72,14 +66,4 @@ pub fn get_query_service(
         _ => panic!("Invalid Query Parameter"),
     };
     query_service
-}
-
-/// A Python module implemented in Rust. The name of this function must match
-/// the `lib.name` setting in the `Cargo.toml`, else Python will not be able to
-/// import the module.
-#[pymodule]
-fn tpch_polars(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
-    m.add_function(wrap_pyfunction!(test_function, m)?)?;
-    m.add_function(wrap_pyfunction!(main, m)?)?;
-    Ok(())
 }
