@@ -10,13 +10,14 @@ pub mod utils;
 use tpch::*;
 
 use arrow::ffi;
-use std::time::Instant;
+use std::time;
+use std::thread;
 use polars::prelude::*;
 use polars_arrow::export::arrow;
 use pyo3::exceptions::PyValueError;
 use pyo3::ffi::Py_uintptr_t;
 use pyo3::{PyAny, PyObject, PyResult};
-use pyo3::types::{PyDict, PyString, PyList, PyLong};
+use pyo3::types::{PyDict, PyString};
 
 /// Take an arrow array from python and convert it to a rust arrow array.
 /// This operation does not copy data.
@@ -117,12 +118,23 @@ fn main() {
     let mut query_service = get_query_service(&q1, 1, data_directory, &mut output_reader);
     log::info!("Running Query: {}", q1);
 
-    let mut query_result: Vec<DataFrame> = vec![];
-    let start_time = Instant::now();
-
     query_service.run();
+    // YOU WANT TO INITIALIZE THE FIGURE HERE, OUTSIDE THE LOOP.
+    #[allow(deprecated)]
+    let gil = Python::acquire_gil();
+    let py = gil.python();
+    let locals = PyDict::new(py);
+    py.run(r#"
+fig = plt.figure(figsize=(5, 4), layout='tight', clip_on=True)
+ax = fig.add_subplot(111)
+fig.show()
+"#, None, Some(locals)).unwrap();
+
+    let py_fig = locals.get_item_with_error("fig").unwrap();
+    let py_ax = locals.get_item_with_error("ax").unwrap();
+
     loop {
-        // let res = py.allow_threads(move |&output_reader| {
+        // let res = py.allow_threads(move || {
             let message = output_reader.read();
             if message.is_eof() {
                 // return Err(message);
@@ -138,7 +150,6 @@ fn main() {
         #[allow(deprecated)]
         let gil = Python::acquire_gil();
         let py = gil.python();
-
         py.run("print(\"HERE\")", None, None).unwrap();
 
         let dict = PyDict::new(py);
@@ -154,10 +165,18 @@ fn main() {
 
         let locals = PyDict::new(py);
         locals.set_item("df", py_df).unwrap();
+        locals.set_item("ax", py_ax).unwrap();
+        locals.set_item("fig", py_fig).unwrap();
         py.run(r#"
-res = df.plot.bar(x='l_returnflag', y='l_linestatus')
-res.show()
+
+df.loc[0, 'sum_qty'] = random.randint(2974251, 223428120)
+ax.clear()
+df.plot(x='count_order', y='sum_qty', ax=ax, kind='bar')
+fig.canvas.draw()
 "#, None, Some(locals)).unwrap();
+        
+        let two_sec = time::Duration::from_millis(2000);
+        thread::sleep(two_sec);
 
         // let plt = py.import("matplotlib.pyplot").unwrap();
         // py_df.call_method("bar");
@@ -165,13 +184,6 @@ res.show()
         // query_result.push(df.clone());
     }
     query_service.join();
-    let end_time = Instant::now();
-    log::info!("Query Result");
-    log::info!("{:?}", query_result[query_result.len() - 1]);
-    log::info!("Query Took: {:.2?}", end_time - start_time);
-
-    // let dfs = query_result;
-
 }
 
 pub fn get_query_service(
